@@ -80,7 +80,15 @@ async def _api_login(username: str, password: str) -> dict:
         }
     }
 
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        # Paso 1: GET para obtener cookiesession1
+        init = await client.get(
+            f"{BALANZ_BASE}/Pages/login.html",
+            headers=_headers(),
+        )
+        logger.info(f"Init cookies: {dict(client.cookies)}")
+
+        # Paso 2: POST login con cookiesession1 incluida automáticamente
         r = await client.post(
             f"{BALANZ_API}/auth/login",
             json=payload,
