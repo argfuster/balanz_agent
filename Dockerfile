@@ -1,6 +1,5 @@
 FROM python:3.11-slim
 
-# Dependencias de sistema para Playwright/Chromium
 RUN apt-get update && apt-get install -y \
     wget curl gnupg \
     libnss3 libatk1.0-0 libatk-bridge2.0-0 \
@@ -13,15 +12,12 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Instalar dependencias Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Instalar Chromium via Playwright
+# Solo install, sin install-deps (ya tenemos las dependencias arriba)
 RUN playwright install chromium
-RUN playwright install-deps chromium
 
-# Copiar código
 COPY . .
 
 EXPOSE 8000
