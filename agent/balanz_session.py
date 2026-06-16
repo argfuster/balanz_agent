@@ -81,14 +81,17 @@ async def _api_login(username: str, password: str) -> dict:
     }
 
     async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        # Paso 1: GET para obtener cookiesession1
-        init = await client.get(
-            f"{BALANZ_BASE}/Pages/login.html",
-            headers=_headers(),
-        )
-        logger.info(f"Init cookies: {dict(client.cookies)}")
+        # Usar cookiesession1 desde variable de entorno o hacer GET para obtenerla
+        session_cookie = os.getenv("BALANZ_SESSION_COOKIE")
+        if session_cookie:
+            client.cookies.set("cookiesession1", session_cookie, domain="productores.balanz.com")
+            logger.info("Usando cookiesession1 desde variable de entorno")
+        else:
+            await client.get(f"{BALANZ_BASE}/", headers=_headers())
+            await client.get(f"{BALANZ_BASE}/Pages/login.html", headers=_headers())
+            logger.info(f"Init cookies: {dict(client.cookies)}")
 
-        # Paso 2: POST login con cookiesession1 incluida automáticamente
+        # POST login
         r = await client.post(
             f"{BALANZ_API}/auth/login",
             json=payload,
