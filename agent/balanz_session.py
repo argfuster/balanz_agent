@@ -1,10 +1,5 @@
 """
 balanz_session.py
------------------
-Maneja la autenticación con productores.balanz.com.
-- Login via Playwright (headless)
-- Cachea cookies en Supabase con TTL configurable
-- Renueva la sesión automáticamente cuando expira
 """
 
 import json
@@ -22,6 +17,7 @@ BALANZ_BASE = "https://productores.balanz.com"
 BALANZ_API  = f"{BALANZ_BASE}/api/v1"
 SESSION_TTL = int(os.getenv("SESSION_TTL_HOURS", 4))
 PRODUCER_ID = os.getenv("BALANZ_PRODUCER_ID", "93139")
+HEADLESS    = os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() == "true"
 
 
 def _get_supabase() -> Client:
@@ -31,15 +27,27 @@ def _get_supabase() -> Client:
     )
 
 
+async def _validate_session(cookies: dict) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{BALANZ_API}/notificaciones",
+                cookies=cookies,
+                headers={"Referer": f"{BALANZ_BASE}/"},
+            )
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
 async def _playwright_login(username: str, password: str) -> dict:
-    """
-    Abre un browser headless, completa el login en Balanz
-    y devuelve las cookies de sesión como dict.
-    """
-    logger.info("Iniciando login en Balanz via Playwright...")
+    logger.info(f"Iniciando login (headless={HEADLESS})...")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=HEADLESS,
+            args=["--no-sandbox", "--disable-setuid-sandbox"] if HEADLESS else []
+        )
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -49,104 +57,39 @@ async def _playwright_login(username: str, password: str) -> dict:
         )
         page = await context.new_page()
 
-        # 1. Cargar página de login
-        await page.goto(f"{BALANZ_BASE}/", wait_until="networkidle")
+        # Ir al portal — redirige al login si no hay sesión
+        await page.goto(f"{BALANZ_BASE}/", wait_until="domcontentloaded")
+        await page.wait_for_timeout(3000)
 
-        # 2. Detectar campos de login (el portal usa distintos selectores)
-        selectors_user = [
-            "input[name='usuario']",
-            "input[name='user']",
-            "input[type='text']:visible",
-            "input[placeholder*='usu']:visible",
-        ]
-        selectors_pass = [
-            "input[name='password']",
-            "input[type='password']:visible",
-        ]
+        logger.info(f"URL inicial: {page.url}")
 
-        user_field = None
-        for sel in selectors_user:
-            if await page.locator(sel).count() > 0:
-                user_field = sel
-                break
-
-        pass_field = None
-        for sel in selectors_pass:
-            if await page.locator(sel).count() > 0:
-                pass_field = sel
-                break
-
-        if not user_field:
-            logger.warning("No se encontró campo de usuario — puede que ya haya sesión activa")
-        else:
-            # Fill usuario
-            await page.click(user_field)
-            await page.fill(user_field, username)
-            await page.wait_for_timeout(1000)
-
-            # El campo password está oculto en el DOM — usamos JS para llenarlo
-            await page.evaluate(
-                """(password) => {
-                    const inputs = document.querySelectorAll('input[type=\"password\"]');
-                    for (const el of inputs) {
-                        el.removeAttribute('style');
-                        el.style.display = 'block';
-                        el.value = password;
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                    }
-                }""",
-                password
-            )
+        # Completar login si estamos en la página de login
+        if "login" in page.url.lower() or "Pages" in page.url:
+            await page.fill("input[placeholder*='Usuario']", username)
+            await page.fill("input[placeholder*='Clave']", password)
             await page.wait_for_timeout(500)
+            await page.click("a:has-text('Ingresar')")
+            await page.wait_for_load_state("networkidle", timeout=20000)
+            await page.wait_for_timeout(3000)
 
-            # Submit via JS
-            await page.evaluate(
-                """() => {
-                    const btn = document.querySelector('button[type=\"submit\"], input[type=\"submit\"], button.btn-login, #btn-login');
-                    if (btn) btn.click();
-                }"""
-            )
-            await page.wait_for_load_state("networkidle", timeout=15000)
+        logger.info(f"URL post-login: {page.url}")
 
-        # 3. Verificar que estamos en home autenticado
-        current_url = page.url
-        logger.info(f"URL post-login: {current_url}")
-        # Solo fallar si explícitamente estamos en la página de login
-        if "/login" in current_url:
-            await browser.close()
-            raise ValueError(f"Login fallido — URL: {current_url}")
+        # Esperar a que cargue el frame de asesores
+        await page.wait_for_timeout(2000)
 
-        # 4. Extraer cookies
+        # Capturar cookies de todos los contextos (incluyendo frames)
         raw_cookies = await context.cookies()
         await browser.close()
 
     cookies = {c["name"]: c["value"] for c in raw_cookies}
-    logger.info(f"Login exitoso. {len(cookies)} cookies obtenidas.")
+    logger.info(f"Login completado. {len(cookies)} cookies: {list(cookies.keys())}")
     return cookies
 
 
-async def _validate_session(cookies: dict) -> bool:
-    """Hace una llamada liviana a la API para verificar que las cookies son válidas."""
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                f"{BALANZ_API}/notificaciones",
-                cookies=cookies,
-            )
-            return r.status_code == 200
-    except Exception:
-        return False
-
-
 async def get_session() -> dict:
-    """
-    Punto de entrada principal.
-    Devuelve cookies válidas, renovando la sesión si es necesario.
-    """
     supabase = _get_supabase()
 
-    # 1. Buscar sesión guardada en Supabase
+    # 1. Buscar sesión cacheada en Supabase
     try:
         result = (
             supabase.table("balanz_sessions")
@@ -155,31 +98,29 @@ async def get_session() -> dict:
             .limit(1)
             .execute()
         )
-
         if result.data:
             row = result.data[0]
             created = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
             age = datetime.now(timezone.utc) - created
-
             if age < timedelta(hours=SESSION_TTL):
                 cookies = json.loads(row["cookies"])
-                # Validar que la sesión sigue activa
                 if await _validate_session(cookies):
                     logger.info(f"Sesión cacheada válida (edad: {age})")
                     return cookies
-                else:
-                    logger.info("Sesión cacheada expirada — renovando...")
+                logger.info("Sesión cacheada inválida — renovando...")
     except Exception as e:
-        logger.warning(f"Error leyendo sesión de Supabase: {e}")
+        logger.warning(f"Error leyendo Supabase: {e}")
 
-    # 2. Hacer login fresco
+    # 2. Login fresco
     username = os.getenv("BALANZ_USER")
     password = os.getenv("BALANZ_PASS")
-
     if not username or not password:
-        raise ValueError("BALANZ_USER y BALANZ_PASS deben estar definidos en .env")
+        raise ValueError("BALANZ_USER y BALANZ_PASS deben estar definidos")
 
     cookies = await _playwright_login(username, password)
+
+    if not await _validate_session(cookies):
+        raise ValueError("Login completado pero la sesión no es válida. Revisá credenciales.")
 
     # 3. Guardar en Supabase
     try:
@@ -189,6 +130,6 @@ async def get_session() -> dict:
         }).execute()
         logger.info("Sesión guardada en Supabase")
     except Exception as e:
-        logger.warning(f"No se pudo guardar sesión en Supabase: {e}")
+        logger.warning(f"No se pudo guardar sesión: {e}")
 
     return cookies
