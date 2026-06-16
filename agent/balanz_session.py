@@ -111,9 +111,11 @@ async def _playwright_login(username: str, password: str) -> dict:
 
         # 3. Verificar que estamos en home autenticado
         current_url = page.url
-        if "login" in current_url or current_url == f"{BALANZ_BASE}/":
+        logger.info(f"URL post-login: {current_url}")
+        # Solo fallar si explícitamente estamos en la página de login
+        if "/login" in current_url:
             await browser.close()
-            raise ValueError("Login fallido — verificá las credenciales")
+            raise ValueError(f"Login fallido — URL: {current_url}")
 
         # 4. Extraer cookies
         raw_cookies = await context.cookies()
