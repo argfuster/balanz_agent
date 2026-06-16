@@ -76,13 +76,37 @@ async def _playwright_login(username: str, password: str) -> dict:
                 pass_field = sel
                 break
 
-        if not user_field or not pass_field:
-            # Si ya está logueado (sesión activa en browser), igual continúa
-            logger.warning("No se encontraron campos de login — puede que ya haya sesión activa")
+        if not user_field:
+            logger.warning("No se encontró campo de usuario — puede que ya haya sesión activa")
         else:
+            # Fill usuario
+            await page.click(user_field)
             await page.fill(user_field, username)
-            await page.fill(pass_field, password)
-            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(1000)
+
+            # El campo password está oculto en el DOM — usamos JS para llenarlo
+            await page.evaluate(
+                """(password) => {
+                    const inputs = document.querySelectorAll('input[type=\"password\"]');
+                    for (const el of inputs) {
+                        el.removeAttribute('style');
+                        el.style.display = 'block';
+                        el.value = password;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }""",
+                password
+            )
+            await page.wait_for_timeout(500)
+
+            # Submit via JS
+            await page.evaluate(
+                """() => {
+                    const btn = document.querySelector('button[type=\"submit\"], input[type=\"submit\"], button.btn-login, #btn-login');
+                    if (btn) btn.click();
+                }"""
+            )
             await page.wait_for_load_state("networkidle", timeout=15000)
 
         # 3. Verificar que estamos en home autenticado
