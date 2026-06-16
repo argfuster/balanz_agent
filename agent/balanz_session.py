@@ -63,11 +63,20 @@ async def _api_login(username: str, password: str) -> dict:
     logger.info("Iniciando login via API...")
 
     nonce = str(uuid.uuid4()).upper()
+    dispositivo_id = str(uuid.uuid4())
     payload = {
         "data": {
             "user": username,
             "pass": password,
             "nonce": nonce,
+            "source": "WebV1",
+            "idDispositivo": dispositivo_id,
+            "TipoDispositivo": "Web",
+            "Nombre": "Windows 10 Chrome 124.0.0.0",
+            "SistemaOperativo": "Windows",
+            "VersionSO": "10",
+            "VersionAPP": "1.0.0",
+            "aa": 1,
         }
     }
 
