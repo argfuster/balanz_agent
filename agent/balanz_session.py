@@ -1,22 +1,24 @@
 """
 balanz_session.py
+-----------------
+Login directo via API REST — sin Playwright.
+POST /api/v1/auth/login → AccessToken + idSesion
 """
 
 import json
 import os
+import uuid
 import logging
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from playwright.async_api import async_playwright
 from supabase import create_client, Client
 
 logger = logging.getLogger(__name__)
 
 BALANZ_BASE = "https://productores.balanz.com"
 BALANZ_API  = f"{BALANZ_BASE}/api/v1"
-SESSION_TTL = int(os.getenv("SESSION_TTL_HOURS", 4))
-PRODUCER_ID = os.getenv("BALANZ_PRODUCER_ID", "93139")
+SESSION_TTL = int(os.getenv("SESSION_TTL_HOURS", 8))
 
 
 def _get_supabase() -> Client:
@@ -26,90 +28,83 @@ def _get_supabase() -> Client:
     )
 
 
-async def _validate_session(cookies: dict) -> bool:
+def _headers(token: str = None) -> dict:
+    h = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Accept-Language": "es-AR,es;q=0.9",
+        "Origin": BALANZ_BASE,
+        "Referer": f"{BALANZ_BASE}/",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+    }
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    return h
+
+
+async def _validate_session(token: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
                 f"{BALANZ_API}/notificaciones",
-                cookies=cookies,
-                headers={"Referer": f"{BALANZ_BASE}/"},
+                headers=_headers(token),
             )
             return r.status_code == 200
     except Exception:
         return False
 
 
-async def _playwright_login(username: str, password: str) -> dict:
-    logger.info("Iniciando login en Balanz...")
+async def _api_login(username: str, password: str) -> dict:
+    """Login directo via API. Devuelve {token, idSesion, idPersona}."""
+    logger.info("Iniciando login via API...")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--window-size=1920,1080",
-            ]
-        )
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1920, "height": 1080},
-            java_script_enabled=True,
-            # Evitar detección de headless
-            extra_http_headers={
-                "Accept-Language": "es-AR,es;q=0.9",
-            }
+    nonce = str(uuid.uuid4()).upper()
+    payload = {
+        "data": {
+            "user": username,
+            "pass": password,
+            "nonce": nonce,
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            f"{BALANZ_API}/auth/login",
+            json=payload,
+            headers=_headers(),
         )
 
-        # Ocultar que es Playwright/headless
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['es-AR', 'es'] });
-        """)
+    if r.status_code != 200:
+        raise ValueError(f"Login fallido — status {r.status_code}: {r.text[:200]}")
 
-        page = await context.new_page()
+    data = r.json()
+    token = data.get("AccessToken")
+    id_sesion = data.get("idSesion")
+    id_persona = data.get("idPersona")
 
-        # Ir al portal
-        await page.goto(f"{BALANZ_BASE}/", wait_until="domcontentloaded")
-        await page.wait_for_timeout(3000)
-        logger.info(f"URL inicial: {page.url}")
+    if not token:
+        raise ValueError(f"Login OK pero sin AccessToken. Respuesta: {data}")
 
-        # Completar login
-        await page.goto(f"{BALANZ_BASE}/Pages/login.html", wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
-
-        await page.fill("input[placeholder*='Usuario']", username)
-        await page.wait_for_timeout(300)
-        await page.fill("input[placeholder*='Clave']", password)
-        await page.wait_for_timeout(500)
-
-        # Click en Ingresar
-        await page.click("a:has-text('Ingresar')")
-        await page.wait_for_load_state("networkidle", timeout=20000)
-        await page.wait_for_timeout(5000)  # Esperar que carguen los frames
-
-        logger.info(f"URL post-login: {page.url}")
-
-        # Capturar cookies de todo el contexto
-        raw_cookies = await context.cookies()
-        await browser.close()
-
-    cookies = {c["name"]: c["value"] for c in raw_cookies}
-    logger.info(f"Login completado. {len(cookies)} cookies: {list(cookies.keys())}")
-    return cookies
+    logger.info(f"Login exitoso — idPersona: {id_persona}, idSesion: {id_sesion}")
+    return {
+        "token": token,
+        "idSesion": id_sesion,
+        "idPersona": id_persona,
+    }
 
 
 async def get_session() -> dict:
+    """
+    Devuelve {token, idSesion, idPersona} válidos.
+    Cachea en Supabase por SESSION_TTL horas.
+    """
     supabase = _get_supabase()
 
-    # 1. Buscar sesión cacheada en Supabase
+    # 1. Buscar sesión cacheada
     try:
         result = (
             supabase.table("balanz_sessions")
@@ -123,10 +118,10 @@ async def get_session() -> dict:
             created = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
             age = datetime.now(timezone.utc) - created
             if age < timedelta(hours=SESSION_TTL):
-                cookies = json.loads(row["cookies"])
-                if await _validate_session(cookies):
+                session = json.loads(row["cookies"])
+                if await _validate_session(session.get("token")):
                     logger.info(f"Sesión cacheada válida (edad: {age})")
-                    return cookies
+                    return session
                 logger.info("Sesión cacheada inválida — renovando...")
     except Exception as e:
         logger.warning(f"Error leyendo Supabase: {e}")
@@ -137,19 +132,16 @@ async def get_session() -> dict:
     if not username or not password:
         raise ValueError("BALANZ_USER y BALANZ_PASS deben estar definidos")
 
-    cookies = await _playwright_login(username, password)
-
-    if not await _validate_session(cookies):
-        raise ValueError(f"Login completado pero sesión inválida. Cookies obtenidas: {list(cookies.keys())}")
+    session = await _api_login(username, password)
 
     # 3. Guardar en Supabase
     try:
         supabase.table("balanz_sessions").insert({
-            "cookies": json.dumps(cookies),
+            "cookies": json.dumps(session),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
         logger.info("Sesión guardada en Supabase")
     except Exception as e:
         logger.warning(f"No se pudo guardar sesión: {e}")
 
-    return cookies
+    return session
